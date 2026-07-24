@@ -1,15 +1,14 @@
-
-
 """
-simulation.py
-
-
 탄소 배출과 지구온난화 — Pygame UI 껍데기
 디자인 기획서 기반: 사이드바 / 2x2 메인 / 하단 타임라인
 """
 
 
+from __future__ import annotations
+
+
 import math
+import os
 import random
 import sys
 
@@ -29,6 +28,10 @@ PANEL_H = MAIN_H // 2
 
 
 YEAR_MIN, YEAR_MAX = 1850, 2100
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMG_DIR = os.path.join(BASE_DIR, "img")
 
 
 # ── 색상 ──────────────────────────────────────────────────────
@@ -102,7 +105,28 @@ def earth_color(delta_t: float):
 
 
 
+def load_keyed_image(path: str) -> pygame.Surface:
+    """검은 배경을 투명 처리해 로드."""
+    img = pygame.image.load(path).convert()
+    img.set_colorkey((0, 0, 0))
+    return img
+
+
+
+
+def scale_keep_aspect(surf: pygame.Surface, target_h: int) -> pygame.Surface:
+    w, h = surf.get_size()
+    scale = target_h / h
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return pygame.transform.smoothscale(surf, new_size)
+
+
+
+
 class Spark:
+    """기존 원형 불꽃 파티클 (느낌 유지)."""
+
+
     def __init__(self, x, y):
         self.x = x
         self.y = y
@@ -134,6 +158,54 @@ class Spark:
 
 
 
+class FireEffect:
+    """
+    불꽃 스프라이트 애니메이션.
+    set 0: f1~f5 / set 1: f6~f10 을 1→5 프레임으로 순환.
+    """
+
+
+    FRAME_DT = 0.09  # 프레임당 초
+
+
+    def __init__(self, x: float, y: float, set_id: int, scale: float, framesets: list):
+        self.x = x
+        self.y = y  # 이펙트 하단(불꽃 뿌리) 기준
+        self.set_id = set_id
+        self.frames = framesets[set_id]
+        self.frame = 0
+        self.timer = random.uniform(0, self.FRAME_DT)
+        self.scale = scale
+        self.life = random.uniform(2.5, 5.0)
+        self._scaled: list[pygame.Surface] | None = None
+
+
+    def _get_frames(self) -> list[pygame.Surface]:
+        if self._scaled is None:
+            h = max(40, int(120 * self.scale))
+            self._scaled = [scale_keep_aspect(f, h) for f in self.frames]
+        return self._scaled
+
+
+    def update(self, dt: float) -> bool:
+        self.timer += dt
+        while self.timer >= self.FRAME_DT:
+            self.timer -= self.FRAME_DT
+            self.frame = (self.frame + 1) % len(self.frames)
+        self.life -= dt
+        return self.life > 0
+
+
+    def draw(self, surface: pygame.Surface):
+        frames = self._get_frames()
+        img = frames[self.frame]
+        # 하단 정렬: 불꽃 뿌리를 (x, y)에 맞춤
+        rect = img.get_rect(midbottom=(int(self.x), int(self.y)))
+        surface.blit(img, rect)
+
+
+
+
 class Simulation:
     def __init__(self):
         pygame.init()
@@ -151,6 +223,7 @@ class Simulation:
         self.playing = False
         self.dragging = False
         self.sparks: list[Spark] = []
+        self.fire_effects: list[FireEffect] = []
 
 
         # 버튼 / 슬라이더 rect (매 프레임 갱신)
@@ -166,6 +239,101 @@ class Simulation:
         }
 
 
+        self._load_assets()
+        self.trees: list[dict] = []  # 패널 기준 나무 배치 (최초 그리기 때 생성)
+
+
+    def _load_assets(self):
+        # 나무 t1(어린) / t2(중간) / t3(큰)
+        self.tree_imgs = [
+            load_keyed_image(os.path.join(IMG_DIR, f"t{i}.png"))
+            for i in (1, 2, 3)
+        ]
+        # 불꽃 세트1: f1~f5 / 세트2: f6~f10
+        set_a = [
+            load_keyed_image(os.path.join(IMG_DIR, f"f{i}.png"))
+            for i in range(1, 6)
+        ]
+        set_b = [
+            load_keyed_image(os.path.join(IMG_DIR, f"f{i}.png"))
+            for i in range(6, 11)
+        ]
+        self.fire_framesets = [set_a, set_b]
+
+
+    def _ensure_trees(self, ground: pygame.Rect):
+        """바닥에 맞춰 9그루 골고루 배치 (겹침 허용). 온도↑ 시 최대 4그루까지 감소."""
+        if self.trees:
+            return
+
+
+        # (타입인덱스, 표시높이) — 어린/중간/큰 섞어 9그루
+        specs = [
+            (0, 105),  # t1 어린
+            (1, 145),  # t2 중간
+            (2, 185),  # t3 큰
+            (0, 95),
+            (1, 140),
+            (2, 170),
+            (0, 110),
+            (1, 135),
+            (2, 160),
+        ]
+        n = len(specs)
+        margin = 24
+        usable = ground.width - margin * 2
+        for i, (kind, th) in enumerate(specs):
+            frac = (i + 0.5) / n
+            jitter = random.randint(-14, 14)
+            cx = ground.left + margin + int(frac * usable) + jitter
+            ground_y = ground.bottom - 10
+            img = scale_keep_aspect(self.tree_imgs[kind], th)
+            self.trees.append({
+                "img": img,
+                "cx": cx,
+                "ground_y": ground_y,
+                "kind": kind,
+            })
+
+
+        # 큰 나무부터 그려 작은 나무가 앞에 오도록
+        self.trees.sort(key=lambda t: -t["img"].get_height())
+        # 소실 순서: 어린 나무·가장자리부터 먼저 사라지도록
+        burn_order = sorted(
+            range(len(self.trees)),
+            key=lambda i: (self.trees[i]["kind"], abs(self.trees[i]["cx"] - ground.centerx)),
+        )
+        for rank, idx in enumerate(burn_order):
+            self.trees[idx]["burn_rank"] = rank  # 0이 가장 먼저 소실
+
+
+    def _tree_alpha(self, burn_rank: int, danger: float) -> float:
+        """
+        온도↑에 따라 burn_rank 낮은 나무부터 소실.
+        9그루 → 최고온에서 4그루. 소실 중인 나무는 페이드아웃.
+        """
+        burned = danger * 5.0  # 0~5그루 분량 소실
+        if burn_rank < math.floor(burned):
+            return 0.0  # 이미 소실
+        if burn_rank == math.floor(burned) and burned < 5:
+            return 1.0 - (burned - math.floor(burned))  # 소실 중
+        return 1.0
+
+
+    def _tint_tree(self, img: pygame.Surface, danger: float, alpha: float = 1.0) -> pygame.Surface:
+        """온도↑ → 붉고 어두운 틴트 + 알파."""
+        out = img.copy()
+        r = int(255 - danger * 40)
+        g = int(255 - danger * 130)
+        b = int(255 - danger * 160)
+        tint = pygame.Surface(out.get_size())
+        tint.fill((max(80, r), max(40, g), max(30, b)))
+        out.blit(tint, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+        if alpha < 0.99:
+            out.set_alpha(int(255 * alpha))
+        return out
+
+
     # ── 레이아웃 helpers ──────────────────────────────────────
     def panel_rect(self, col: int, row: int) -> pygame.Rect:
         pad = 8
@@ -174,6 +342,13 @@ class Simulation:
         w = PANEL_W - pad * 2
         h = PANEL_H - pad * 2
         return pygame.Rect(x, y, w, h)
+
+
+    def _fire_ground(self) -> pygame.Rect:
+        rect = self.panel_rect(1, 1)
+        ground = rect.inflate(-24, -40)
+        ground.top += 16
+        return ground
 
 
     # ── 이벤트 ────────────────────────────────────────────────
@@ -236,18 +411,53 @@ class Simulation:
                 self.graph_points[self.scenario] = pts[-400:]
 
 
-        # 산불 파티클 스폰
+        # 산불: 원형 스파크 + 스프라이트 이펙트
         fire_intensity = max(0.0, (delta_t - 1.0) / 3.5)  # 1°C 넘으면 시작
+        ground = self._fire_ground()
+
+
+        # 원형 스파크 (기존 느낌 유지)
         spawn_n = int(fire_intensity * 4)
         if fire_intensity > 0.05 and random.random() < fire_intensity:
-            br = self.panel_rect(1, 1)
             for _ in range(max(1, spawn_n)):
-                sx = random.randint(br.left + 20, br.right - 20)
-                sy = br.bottom - 40
+                sx = random.randint(ground.left + 20, ground.right - 20)
+                sy = ground.bottom - 40
                 self.sparks.append(Spark(sx, sy))
 
 
         self.sparks = [s for s in self.sparks if s.update()]
+
+
+        # 스프라이트 불꽃: 목표 개수 = 온도에 비례 (위·아래 골고루)
+        target_fx = int(fire_intensity * 14)  # 최대 ~14개
+        if fire_intensity > 0.08 and len(self.fire_effects) < target_fx:
+            need = min(2, target_fx - len(self.fire_effects))
+            for _ in range(need):
+                self._spawn_fire_effect(ground, fire_intensity)
+
+
+        self.fire_effects = [fx for fx in self.fire_effects if fx.update(dt)]
+        # 온도가 떨어지면 초과분 수명 단축
+        if len(self.fire_effects) > target_fx:
+            for fx in self.fire_effects[target_fx:]:
+                fx.life = min(fx.life, 0.4)
+
+
+    def _spawn_fire_effect(self, ground: pygame.Rect, intensity: float):
+        """화면 위·아래에 불꽃 이펙트를 섞어 스폰."""
+        set_id = random.choice([0, 1])  # f1~5 / f6~10 섞기
+        x = random.randint(ground.left + 16, ground.right - 16)
+        # 위쪽(수관) / 아래쪽(지면) 반반
+        if random.random() < 0.5:
+            # 위: 패널 상단~중상단
+            y = random.randint(ground.top + 70, ground.centery + 10)
+        else:
+            # 아래: 지면 근처 (불꽃 하단 = 바닥)
+            y = random.randint(ground.bottom - 50, ground.bottom - 8)
+        scale = random.uniform(0.55, 0.85 + intensity * 0.4)
+        self.fire_effects.append(
+            FireEffect(x, y, set_id, scale, self.fire_framesets)
+        )
 
 
     # ── 그리기 ────────────────────────────────────────────────
@@ -474,34 +684,62 @@ class Simulation:
         self._draw_panel_frame(rect, "산불 위험도")
 
 
-        ground = rect.inflate(-24, -40)
-        ground.top += 16
-        pygame.draw.rect(self.screen, (28, 48, 32), ground, border_radius=4)
-
-
+        ground = self._fire_ground()
         progress = year_progress(self.year)
         delta_t = scenario_delta_t(self.scenario, progress)
         danger = max(0.0, min(1.0, (delta_t - 0.8) / 3.5))
 
 
-        # 나무 (단순 세로 막대 + 원 수관)
-        tree_count = 9
-        for i in range(tree_count):
-            tx = ground.left + 30 + i * ((ground.width - 60) // (tree_count - 1))
-            base = ground.bottom - 12
-            trunk_h = 28
-            # 열기에 따라 초록 → 갈변
-            canopy = lerp_color((40, 140, 60), (90, 70, 40), danger)
-            pygame.draw.rect(self.screen, (70, 50, 30), (tx - 3, base - trunk_h, 6, trunk_h))
-            pygame.draw.circle(self.screen, canopy, (tx, base - trunk_h - 8), 14)
+        # 온도↑ → 숲 배경도 어둡고 붉게
+        bg = lerp_color((28, 48, 32), (36, 22, 18), danger)
+        soil_c = lerp_color((42, 58, 36), (48, 28, 22), danger)
+        pygame.draw.rect(self.screen, bg, ground, border_radius=4)
+        soil = pygame.Rect(ground.left, ground.bottom - 14, ground.width, 14)
+        pygame.draw.rect(self.screen, soil_c, soil)
+
+
+        self._ensure_trees(ground)
+
+
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(ground)
+
+
+        # 나무: 하단=바닥, burn_rank 낮은 것부터 소실 (9→4)
+        for tree in self.trees:
+            alpha = self._tree_alpha(tree["burn_rank"], danger)
+            if alpha < 0.05:
+                continue
+            img = self._tint_tree(tree["img"], danger, alpha)
+            dest = img.get_rect(midbottom=(tree["cx"], tree["ground_y"]))
+            self.screen.blit(img, dest)
+
+
+        for fx in self.fire_effects:
+            fx.draw(self.screen)
 
 
         for spark in self.sparks:
-            if ground.collidepoint(int(spark.x), int(spark.y)):
-                spark.draw(self.screen)
+            spark.draw(self.screen)
 
 
-        # 위험도 바
+        # 분위기 필터: 붉고 어두운 오버레이
+        if danger > 0.02:
+            haze = pygame.Surface(ground.size, pygame.SRCALPHA)
+            haze.fill((90, 18, 8, int(danger * 70)))
+            glow_a = int(danger * 45)
+            half_h = max(1, ground.height // 2)
+            for i in range(0, half_h, 4):
+                a = int(glow_a * (1.0 - i / half_h))
+                if a <= 0:
+                    break
+                pygame.draw.rect(haze, (180, 50, 20, a), (0, i, ground.width, 4))
+            self.screen.blit(haze, ground.topleft)
+
+
+        self.screen.set_clip(prev_clip)
+
+
         bar = pygame.Rect(rect.left + 14, rect.bottom - 28, rect.width - 28, 10)
         pygame.draw.rect(self.screen, (40, 50, 60), bar, border_radius=3)
         fill_w = int(bar.width * danger)
@@ -590,6 +828,7 @@ class Simulation:
 
 if __name__ == "__main__":
     Simulation().run()
+
 
 
 
